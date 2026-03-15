@@ -1,5 +1,4 @@
 import os
-import time
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -25,70 +24,65 @@ LOOKBACK_DAYS = 90
 RSI_PERIOD = 14
 ZSCORE_WINDOW = 20
 
-
-AV_BASE = "https://www.alphavantage.co/query"
-# Free tier: 25 requests/day, 5 requests/minute.
-# 11 tickers = 11 requests per full fetch. Stay under 5/min with a small delay.
-AV_REQUEST_DELAY = 13  # seconds between ticker calls (safe under 5/min limit)
+TIINGO_BASE = "https://api.tiingo.com/tiingo/daily"
 
 
-def _fetch_ticker_av(ticker: str, api_key: str, session: requests.Session) -> pd.Series:
-    """Fetch daily closing prices for one ticker from Alpha Vantage."""
-    resp = session.get(AV_BASE, params={
-        "function": "TIME_SERIES_DAILY",
-        "symbol": ticker,
-        "outputsize": "compact",   # last ~100 trading days — enough for 90-day lookback
-        "datatype": "json",
-        "apikey": api_key,
-    }, timeout=15)
+def _get_token() -> str:
+    """Read token from Streamlit secrets (Cloud) or env var (local/other)."""
+    try:
+        return st.secrets["TIINGO_TOKEN"]
+    except Exception:
+        return os.environ.get("TIINGO_TOKEN", "")
+
+
+def _fetch_ticker_tiingo(ticker: str, token: str, start: str, session: requests.Session) -> pd.Series:
+    """Fetch adjusted daily close prices for one ticker from Tiingo."""
+    resp = session.get(
+        f"{TIINGO_BASE}/{ticker}/prices",
+        params={"startDate": start, "token": token},
+        headers={"Content-Type": "application/json"},
+        timeout=15,
+    )
     resp.raise_for_status()
-    payload = resp.json()
+    data = resp.json()
 
-    if "Time Series (Daily)" not in payload:
-        # Surface rate-limit / bad key messages from AV
-        note = payload.get("Note") or payload.get("Information") or payload
-        print(f"[fetch_data] {ticker} — unexpected response: {note}")
+    if not data:
+        print(f"[fetch_data] {ticker} — empty response")
         return pd.Series(dtype=float)
 
     series = pd.Series({
-        pd.Timestamp(date): float(vals["4. close"])
-        for date, vals in payload["Time Series (Daily)"].items()
+        pd.Timestamp(row["date"]).tz_localize(None): row["adjClose"]
+        for row in data
+        if row.get("adjClose") is not None
     }).sort_index()
     return series
 
 
 @st.cache_data(ttl=3600)
 def fetch_data(as_of: str) -> pd.DataFrame:
-    """Fetch 90 days of closing prices from Alpha Vantage TIME_SERIES_DAILY.
-    `as_of` is a cache-bust key; the real data is always fresh on a cache miss."""
-    api_key = os.environ.get("ALPHA_VANTAGE_KEY", "")
-    if not api_key:
-        return pd.DataFrame()   # caller checks and shows st.error()
+    """Fetch 90 days of adjusted closing prices from Tiingo.
+    `as_of` is a cache-bust key; data is always fresh on a cache miss."""
+    token = _get_token()
+    if not token:
+        return pd.DataFrame()  # caller shows st.error()
 
+    start_date = (datetime.today() - timedelta(days=LOOKBACK_DAYS + 10)).strftime("%Y-%m-%d")
     session = requests.Session()
-    session.headers["User-Agent"] = "sector-dashboard/1.0"
 
     frames = {}
-    tickers = list(TICKERS.keys())
-    for i, ticker in enumerate(tickers):
+    for ticker in TICKERS:
         try:
-            s = _fetch_ticker_av(ticker, api_key, session)
+            s = _fetch_ticker_tiingo(ticker, token, start_date, session)
             if not s.empty:
                 frames[ticker] = s
         except Exception as exc:
             print(f"[fetch_data] {ticker} failed: {exc}")
 
-        # Rate-limit delay between calls (skip after last ticker)
-        if i < len(tickers) - 1:
-            time.sleep(AV_REQUEST_DELAY)
-
     if not frames:
         print("[fetch_data] ERROR: all tickers returned empty")
         return pd.DataFrame()
 
-    cutoff = datetime.today() - timedelta(days=LOOKBACK_DAYS + 10)
-    prices = pd.DataFrame(frames)
-    prices = prices[prices.index >= pd.Timestamp(cutoff)].dropna(how="all").tail(LOOKBACK_DAYS)
+    prices = pd.DataFrame(frames).dropna(how="all").tail(LOOKBACK_DAYS)
     print(f"[fetch_data] shape={prices.shape}  last_date={prices.index[-1].date() if not prices.empty else 'N/A'}")
     return prices
 
@@ -153,18 +147,19 @@ def make_bar_chart(rs_df: pd.DataFrame, end_date: datetime) -> plt.Figure:
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("📈 Sector Relative Strength Dashboard")
-st.caption("Data via Alpha Vantage · Cache refreshes every hour · End-of-day prices")
+st.caption("Data via Tiingo · Cache refreshes every hour · Adjusted end-of-day prices")
 
-if not os.environ.get("ALPHA_VANTAGE_KEY"):
+if not _get_token():
     st.error(
-        "**ALPHA_VANTAGE_KEY environment variable is not set.**\n\n"
-        "1. Get a free key at https://www.alphavantage.co/support/#api-key\n"
-        "2. Run: `railway variables set ALPHA_VANTAGE_KEY=<your_key>`\n"
-        "3. Redeploy or wait for Railway to restart the service."
+        "**TIINGO_TOKEN is not set.**\n\n"
+        "**Streamlit Community Cloud:** paste your token into the app's "
+        "**Settings → Secrets** section as:\n"
+        "```\nTIINGO_TOKEN = \"your-token-here\"\n```\n"
+        "**Local development:** add the same line to `.streamlit/secrets.toml`."
     )
     st.stop()
 
-# Cache key: reset when the user clicks the button, otherwise stay on the hour.
+# Cache key: reset on Refresh, otherwise keyed to the current hour.
 if "cache_key" not in st.session_state:
     st.session_state.cache_key = datetime.now().strftime("%Y-%m-%d-%H")
 
@@ -179,10 +174,9 @@ with st.spinner("Fetching market data…"):
 
 if prices.empty:
     st.error(
-        "Could not fetch market data from Alpha Vantage. "
-        "This usually means the daily request quota (25/day) has been reached, "
-        "or the API key is invalid. Check Railway logs for details. "
-        "Data will be available again tomorrow, or upgrade to a paid AV plan."
+        "Could not fetch market data from Tiingo. "
+        "Check that your TIINGO_TOKEN is valid and that tiingo.com is reachable. "
+        "See the app logs for per-ticker error details."
     )
     st.stop()
 
