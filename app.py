@@ -26,12 +26,23 @@ ZSCORE_WINDOW = 20
 
 @st.cache_data(ttl=3600)
 def fetch_data(as_of: str) -> pd.DataFrame:
-    """Download 90 days of closing prices. `as_of` busts cache when user clicks Refresh."""
+    """Download 90 days of closing prices. `as_of` busts cache when user clicks Refresh.
+    Retries with end pushed 2 days forward to handle weekend/holiday boundaries."""
     end = datetime.today()
     start = end - timedelta(days=LOOKBACK_DAYS + 10)  # small buffer for weekends
+
     prices = yf.download(list(TICKERS.keys()), start=start, end=end, progress=False)["Close"]
-    prices = prices.dropna(how="all").tail(LOOKBACK_DAYS)
-    return prices
+    prices = prices.dropna(how="all")
+
+    if prices.empty:
+        # Weekend/holiday: yfinance sometimes needs end pushed past today to return data
+        end_extended = end + timedelta(days=2)
+        prices = yf.download(
+            list(TICKERS.keys()), start=start, end=end_extended, progress=False
+        )["Close"]
+        prices = prices.dropna(how="all")
+
+    return prices.tail(LOOKBACK_DAYS)
 
 
 def compute_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
@@ -108,6 +119,14 @@ with col_btn:
 
 with st.spinner("Fetching market data…"):
     prices = fetch_data(st.session_state.cache_key)
+
+if prices.empty:
+    st.error(
+        "Could not fetch market data from Yahoo Finance. "
+        "This can happen during extended outages or if the ticker list changed. "
+        "Try clicking **Refresh Data** in a few minutes."
+    )
+    st.stop()
 
 end_date = prices.index[-1].to_pydatetime()
 
