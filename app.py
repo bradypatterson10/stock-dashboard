@@ -228,3 +228,99 @@ for col, ticker in zip(metric_cols, DETAIL_TICKERS):
     )
 
 st.table(detail_df)
+
+st.divider()
+
+# ─── Monte Carlo Simulation ────────────────────────────────────────────────────
+
+st.subheader("Monte Carlo Simulation")
+
+mc_col1, mc_col2, mc_col3 = st.columns(3)
+with mc_col1:
+    mc_ticker = st.selectbox(
+        "Ticker",
+        options=list(TICKERS.keys()),
+        format_func=lambda t: f"{t} — {TICKERS[t]}",
+        index=0,
+    )
+with mc_col2:
+    mc_investment = st.number_input(
+        "Starting investment ($)",
+        min_value=100,
+        max_value=10_000_000,
+        value=10_000,
+        step=100,
+    )
+with mc_col3:
+    mc_days = st.slider(
+        "Time horizon (trading days)",
+        min_value=21,
+        max_value=756,
+        value=252,
+        step=21,
+        format="%d days",
+    )
+
+N_SIMS = 1000
+
+daily_returns = prices[mc_ticker].pct_change().dropna()
+mu = daily_returns.mean()
+sigma = daily_returns.std()
+current_price = prices[mc_ticker].iloc[-1]
+shares = mc_investment / current_price
+
+rng = np.random.default_rng(seed=42)
+rand_returns = rng.normal(mu, sigma, size=(mc_days, N_SIMS))
+price_paths = current_price * np.cumprod(1 + rand_returns, axis=0)
+portfolio_paths = shares * price_paths  # shape: (mc_days, N_SIMS)
+
+p10 = np.percentile(portfolio_paths, 10, axis=1)
+p50 = np.percentile(portfolio_paths, 50, axis=1)
+p90 = np.percentile(portfolio_paths, 90, axis=1)
+
+final_p10 = portfolio_paths[-1].min() if False else float(p10[-1])
+final_p50 = float(p50[-1])
+final_p90 = float(p90[-1])
+
+fig_mc, ax_mc = plt.subplots(figsize=(12, 5))
+
+ax_mc.plot(portfolio_paths, color="gray", alpha=0.04, linewidth=0.5)
+ax_mc.plot(p10, color="#e74c3c", linewidth=2, label="10th percentile (worst 10%)")
+ax_mc.plot(p50, color="#2980b9", linewidth=2, label="50th percentile (median)")
+ax_mc.plot(p90, color="#2ecc71", linewidth=2, label="90th percentile (best 10%)")
+ax_mc.axhline(mc_investment, color="black", linewidth=1, linestyle="--", label="Starting value")
+
+ax_mc.set_title(
+    f"Monte Carlo Simulation — {mc_ticker} — {N_SIMS:,} paths over {mc_days} trading days",
+    fontsize=13, fontweight="bold",
+)
+ax_mc.set_xlabel("Trading Days")
+ax_mc.set_ylabel("Portfolio Value ($)")
+ax_mc.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+ax_mc.legend()
+plt.tight_layout()
+st.pyplot(fig_mc)
+plt.close(fig_mc)
+
+with st.expander("What does this chart mean?", expanded=True):
+    st.info(
+        f"""
+**What is Monte Carlo simulation?**
+It runs {N_SIMS:,} hypothetical futures for {TICKERS[mc_ticker]} by randomly sampling daily price moves from its historical return distribution (mean {mu*100:.2f}% / day, volatility {sigma*100:.2f}% / day). Each gray line is one possible outcome — not a prediction, just a range of plausible scenarios.
+
+**The three highlighted lines**
+- 🟢 **Green (90th percentile):** Only 10% of simulated outcomes end higher than this — a strong bull run.
+- 🔵 **Blue (50th percentile / median):** Half of all simulations finish above this, half below. The most likely single outcome.
+- 🔴 **Red (10th percentile):** Only 10% of outcomes end lower than this — a significant bear scenario.
+
+**Your numbers over {mc_days} trading days (~{mc_days//21} months)**
+
+| Scenario | Ending value | Change |
+|---|---|---|
+| Median | **${final_p50:,.0f}** | {(final_p50/mc_investment - 1)*100:+.1f}% |
+| Worst 10% | **${final_p10:,.0f}** | {(final_p10/mc_investment - 1)*100:+.1f}% |
+| Best 10% | **${final_p90:,.0f}** | {(final_p90/mc_investment - 1)*100:+.1f}% |
+
+⚠️ **Disclaimer:** These projections are based solely on {TICKERS[mc_ticker]}'s historical volatility over the last 90 days and assume returns are normally distributed. Past volatility does not guarantee future results. This is not financial advice.
+        """
+    )
