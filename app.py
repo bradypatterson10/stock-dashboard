@@ -1,9 +1,8 @@
-import os
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import requests
 from scipy import stats
 from datetime import datetime, timedelta
 
@@ -25,80 +24,27 @@ LOOKBACK_DAYS = 90
 RSI_PERIOD = 14
 ZSCORE_WINDOW = 20
 
-TIINGO_BASE = "https://api.tiingo.com/tiingo/daily"
-
-
-def _get_token() -> str:
-    """Read token from Streamlit secrets (Cloud) or env var (local/other)."""
-    try:
-        return st.secrets["TIINGO_TOKEN"]
-    except Exception:
-        return os.environ.get("TIINGO_TOKEN", "")
-
-
-def _fetch_ticker_tiingo(ticker: str, token: str, start: str, session: requests.Session) -> pd.Series:
-    """Fetch adjusted daily close prices for one ticker from Tiingo."""
-    resp = session.get(
-        f"{TIINGO_BASE}/{ticker}/prices",
-        params={"startDate": start, "token": token},
-        headers={"Content-Type": "application/json"},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    if not data:
-        print(f"[fetch_data] {ticker} — empty response")
-        return pd.Series(dtype=float)
-
-    series = pd.Series({
-        pd.Timestamp(row["date"]).tz_localize(None): row["adjClose"]
-        for row in data
-        if row.get("adjClose") is not None
-    }).sort_index()
+@st.cache_data(ttl=86400)  # 24-hour TTL — 3-year history doesn't change meaningfully day to day
+def fetch_mc_history(ticker: str) -> pd.Series:
+    """Fetch ~3 years of adjusted daily closes for one ticker (Monte Carlo use only)."""
+    hist = yf.Ticker(ticker).history(period="3y", auto_adjust=True)
+    series = hist["Close"].copy()
+    series.index = series.index.tz_localize(None)
+    print(f"[fetch_mc_history] {ticker} — {len(series)} trading days returned")
     return series
 
 
 @st.cache_data(ttl=3600)
-def fetch_mc_history(ticker: str) -> pd.Series:
-    """Fetch ~3 years of daily adjusted closes for a single ticker (Monte Carlo use only)."""
-    token = _get_token()
-    start_date = (datetime.today() - timedelta(days=3 * 365 + 30)).strftime("%Y-%m-%d")
-    session = requests.Session()
-    try:
-        series = _fetch_ticker_tiingo(ticker, token, start_date, session)
-        print(f"[fetch_mc_history] {ticker} — {len(series)} trading days returned")
-        return series
-    except Exception as exc:
-        print(f"[fetch_mc_history] {ticker} failed: {exc}")
-        return pd.Series(dtype=float)
-
-
-@st.cache_data(ttl=3600)
 def fetch_data(as_of: str) -> pd.DataFrame:
-    """Fetch 90 days of adjusted closing prices from Tiingo.
+    """Fetch 90 days of adjusted closing prices via yfinance bulk download.
     `as_of` is a cache-bust key; data is always fresh on a cache miss."""
-    token = _get_token()
-    if not token:
-        return pd.DataFrame()  # caller shows st.error()
-
-    start_date = (datetime.today() - timedelta(days=LOOKBACK_DAYS + 10)).strftime("%Y-%m-%d")
-    session = requests.Session()
-
-    frames = {}
-    for ticker in TICKERS:
-        try:
-            s = _fetch_ticker_tiingo(ticker, token, start_date, session)
-            if not s.empty:
-                frames[ticker] = s
-        except Exception as exc:
-            print(f"[fetch_data] {ticker} failed: {exc}")
-
-    if not frames:
-        print("[fetch_data] ERROR: all tickers returned empty")
-        return pd.DataFrame()
-
-    prices = pd.DataFrame(frames).dropna(how="all").tail(LOOKBACK_DAYS)
+    end = datetime.today()
+    start = end - timedelta(days=LOOKBACK_DAYS + 10)
+    raw = yf.download(
+        list(TICKERS.keys()), start=start, end=end,
+        auto_adjust=True, progress=False,
+    )
+    prices = raw["Close"].dropna(how="all").tail(LOOKBACK_DAYS)
     print(f"[fetch_data] shape={prices.shape}  last_date={prices.index[-1].date() if not prices.empty else 'N/A'}")
     return prices
 
@@ -163,17 +109,17 @@ def make_bar_chart(rs_df: pd.DataFrame, end_date: datetime) -> plt.Figure:
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("📈 Sector Relative Strength Dashboard")
-st.caption("Data via Tiingo · Cache refreshes every hour · Adjusted end-of-day prices")
+st.caption("Data via Yahoo Finance · Cache refreshes every hour · Adjusted end-of-day prices")
 
-if not _get_token():
-    st.error(
-        "**TIINGO_TOKEN is not set.**\n\n"
-        "**Streamlit Community Cloud:** paste your token into the app's "
-        "**Settings → Secrets** section as:\n"
-        "```\nTIINGO_TOKEN = \"your-token-here\"\n```\n"
-        "**Local development:** add the same line to `.streamlit/secrets.toml`."
-    )
-    st.stop()
+# ─── Sidebar: fetch counter ─────────────────────────────────────────────────────
+
+if "api_calls" not in st.session_state:
+    st.session_state.api_calls = 0
+
+st.sidebar.metric("API calls this session", st.session_state.api_calls)
+st.sidebar.caption("Counts yfinance fetch triggers (cache hits are free)")
+
+# ─── Main data load ─────────────────────────────────────────────────────────────
 
 # Cache key: reset on Refresh, otherwise keyed to the current hour.
 if "cache_key" not in st.session_state:
@@ -183,6 +129,7 @@ col_btn, col_ts = st.columns([1, 5])
 with col_btn:
     if st.button("🔄 Refresh Data"):
         st.session_state.cache_key = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        st.session_state.api_calls += 11  # one per ticker
         st.cache_data.clear()
 
 with st.spinner("Fetching market data…"):
@@ -190,9 +137,9 @@ with st.spinner("Fetching market data…"):
 
 if prices.empty:
     st.error(
-        "Could not fetch market data from Tiingo. "
-        "Check that your TIINGO_TOKEN is valid and that tiingo.com is reachable. "
-        "See the app logs for per-ticker error details."
+        "Could not fetch market data from Yahoo Finance. "
+        "This can happen during market closures or yfinance outages. "
+        "Try clicking **🔄 Refresh Data** in a few minutes."
     )
     st.stop()
 
@@ -279,64 +226,75 @@ with mc_col3:
 
 N_SIMS = 1000
 
-with st.spinner(f"Fetching 3-year price history for {mc_ticker}…"):
-    mc_price_series = fetch_mc_history(mc_ticker)
+if st.button("▶ Run Simulation"):
+    st.session_state.mc_run_ticker = mc_ticker
+    st.session_state.api_calls += 1  # one request for the selected ticker
 
-mc_daily_returns = mc_price_series.pct_change().dropna()
-n_history = len(mc_daily_returns)
+if st.session_state.get("mc_run_ticker") != mc_ticker:
+    # Ticker changed since last run — prompt user to re-run
+    st.session_state.pop("mc_run_ticker", None)
 
-if n_history < 500:
-    st.warning(
-        f"Only {n_history} trading days of history available for {mc_ticker} "
-        f"(expected ~756 for 3 years). The simulation will run but estimates "
-        f"may be less reliable due to limited historical data."
+if not st.session_state.get("mc_run_ticker"):
+    st.info("Configure the parameters above and click **▶ Run Simulation** to fetch 3 years of history and generate paths. No API call is made until you click.")
+else:
+    with st.spinner(f"Fetching 3-year price history for {mc_ticker}…"):
+        mc_price_series = fetch_mc_history(mc_ticker)
+
+    mc_daily_returns = mc_price_series.pct_change().dropna()
+    n_history = len(mc_daily_returns)
+
+    if n_history < 500:
+        st.warning(
+            f"Only {n_history} trading days of history available for {mc_ticker} "
+            f"(expected ~756 for 3 years). The simulation will run but estimates "
+            f"may be less reliable due to limited historical data."
+        )
+
+    st.caption(f"Simulation based on **{n_history} trading days** of history (~3 years) · cached 24 hours")
+
+    # Fit a Student's t-distribution to capture fat tails (crashes/rallies)
+    nu, t_loc, t_scale = stats.t.fit(mc_daily_returns)
+
+    current_price = mc_price_series.iloc[-1]
+    shares = mc_investment / current_price
+
+    rand_returns = stats.t.rvs(
+        df=nu, loc=t_loc, scale=t_scale,
+        size=(mc_days, N_SIMS),
+        random_state=42,
     )
+    price_paths = current_price * np.cumprod(1 + rand_returns, axis=0)
+    portfolio_paths = shares * price_paths  # shape: (mc_days, N_SIMS)
 
-st.caption(f"Simulation based on **{n_history} trading days** of history (~3 years)")
+    p10 = np.percentile(portfolio_paths, 10, axis=1)
+    p50 = np.percentile(portfolio_paths, 50, axis=1)
+    p90 = np.percentile(portfolio_paths, 90, axis=1)
 
-# Fit a Student's t-distribution to capture fat tails (crashes/rallies)
-nu, t_loc, t_scale = stats.t.fit(mc_daily_returns)
+    final_p10 = float(p10[-1])
+    final_p50 = float(p50[-1])
+    final_p90 = float(p90[-1])
 
-current_price = mc_price_series.iloc[-1]
-shares = mc_investment / current_price
+    fig_mc, ax_mc = plt.subplots(figsize=(12, 5))
+    ax_mc.plot(portfolio_paths, color="gray", alpha=0.04, linewidth=0.5)
+    ax_mc.plot(p10, color="#e74c3c", linewidth=2, label="10th percentile (worst 10%)")
+    ax_mc.plot(p50, color="#2980b9", linewidth=2, label="50th percentile (median)")
+    ax_mc.plot(p90, color="#2ecc71", linewidth=2, label="90th percentile (best 10%)")
+    ax_mc.axhline(mc_investment, color="black", linewidth=1, linestyle="--", label="Starting value")
+    ax_mc.set_title(
+        f"Monte Carlo Simulation — {mc_ticker} — {N_SIMS:,} paths over {mc_days} trading days",
+        fontsize=13, fontweight="bold",
+    )
+    ax_mc.set_xlabel("Trading Days")
+    ax_mc.set_ylabel("Portfolio Value ($)")
+    ax_mc.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax_mc.legend()
+    plt.tight_layout()
+    st.pyplot(fig_mc)
+    plt.close(fig_mc)
 
-rand_returns = stats.t.rvs(
-    df=nu, loc=t_loc, scale=t_scale,
-    size=(mc_days, N_SIMS),
-    random_state=42,
-)
-price_paths = current_price * np.cumprod(1 + rand_returns, axis=0)
-portfolio_paths = shares * price_paths  # shape: (mc_days, N_SIMS)
-
-p10 = np.percentile(portfolio_paths, 10, axis=1)
-p50 = np.percentile(portfolio_paths, 50, axis=1)
-p90 = np.percentile(portfolio_paths, 90, axis=1)
-
-final_p10 = float(p10[-1])
-final_p50 = float(p50[-1])
-final_p90 = float(p90[-1])
-
-fig_mc, ax_mc = plt.subplots(figsize=(12, 5))
-ax_mc.plot(portfolio_paths, color="gray", alpha=0.04, linewidth=0.5)
-ax_mc.plot(p10, color="#e74c3c", linewidth=2, label="10th percentile (worst 10%)")
-ax_mc.plot(p50, color="#2980b9", linewidth=2, label="50th percentile (median)")
-ax_mc.plot(p90, color="#2ecc71", linewidth=2, label="90th percentile (best 10%)")
-ax_mc.axhline(mc_investment, color="black", linewidth=1, linestyle="--", label="Starting value")
-ax_mc.set_title(
-    f"Monte Carlo Simulation — {mc_ticker} — {N_SIMS:,} paths over {mc_days} trading days",
-    fontsize=13, fontweight="bold",
-)
-ax_mc.set_xlabel("Trading Days")
-ax_mc.set_ylabel("Portfolio Value ($)")
-ax_mc.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
-ax_mc.legend()
-plt.tight_layout()
-st.pyplot(fig_mc)
-plt.close(fig_mc)
-
-with st.expander("What does this chart mean?", expanded=True):
-    st.info(
-        f"""
+    with st.expander("What does this chart mean?", expanded=True):
+        st.info(
+            f"""
 **What is Monte Carlo simulation?**
 It runs {N_SIMS:,} hypothetical futures for {TICKERS[mc_ticker]} by randomly sampling daily price moves from 3 years of historical returns ({n_history} trading days). Each gray line is one possible outcome — not a prediction, just a range of plausible scenarios based on how this ETF has actually behaved.
 
@@ -360,5 +318,5 @@ Real markets crash and rally more violently than a standard bell curve predicts.
 | Best 10% | **${final_p90:,.0f}** | {(final_p90/mc_investment - 1)*100:+.1f}% |
 
 ⚠️ **Disclaimer:** These projections are based on {TICKERS[mc_ticker]}'s historical return distribution and are not a guarantee of future results. Past volatility does not predict future performance. This is not financial advice.
-        """
-    )
+            """
+        )
