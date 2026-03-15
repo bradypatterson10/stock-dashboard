@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import requests
+from scipy import stats
 from datetime import datetime, timedelta
 
 st.set_page_config(
@@ -56,6 +57,21 @@ def _fetch_ticker_tiingo(ticker: str, token: str, start: str, session: requests.
         if row.get("adjClose") is not None
     }).sort_index()
     return series
+
+
+@st.cache_data(ttl=3600)
+def fetch_mc_history(ticker: str) -> pd.Series:
+    """Fetch ~3 years of daily adjusted closes for a single ticker (Monte Carlo use only)."""
+    token = _get_token()
+    start_date = (datetime.today() - timedelta(days=3 * 365 + 30)).strftime("%Y-%m-%d")
+    session = requests.Session()
+    try:
+        series = _fetch_ticker_tiingo(ticker, token, start_date, session)
+        print(f"[fetch_mc_history] {ticker} — {len(series)} trading days returned")
+        return series
+    except Exception as exc:
+        print(f"[fetch_mc_history] {ticker} failed: {exc}")
+        return pd.Series(dtype=float)
 
 
 @st.cache_data(ttl=3600)
@@ -263,14 +279,32 @@ with mc_col3:
 
 N_SIMS = 1000
 
-daily_returns = prices[mc_ticker].pct_change().dropna()
-mu = daily_returns.mean()
-sigma = daily_returns.std()
-current_price = prices[mc_ticker].iloc[-1]
+with st.spinner(f"Fetching 3-year price history for {mc_ticker}…"):
+    mc_price_series = fetch_mc_history(mc_ticker)
+
+mc_daily_returns = mc_price_series.pct_change().dropna()
+n_history = len(mc_daily_returns)
+
+if n_history < 500:
+    st.warning(
+        f"Only {n_history} trading days of history available for {mc_ticker} "
+        f"(expected ~756 for 3 years). The simulation will run but estimates "
+        f"may be less reliable due to limited historical data."
+    )
+
+st.caption(f"Simulation based on **{n_history} trading days** of history (~3 years)")
+
+# Fit a Student's t-distribution to capture fat tails (crashes/rallies)
+nu, t_loc, t_scale = stats.t.fit(mc_daily_returns)
+
+current_price = mc_price_series.iloc[-1]
 shares = mc_investment / current_price
 
-rng = np.random.default_rng(seed=42)
-rand_returns = rng.normal(mu, sigma, size=(mc_days, N_SIMS))
+rand_returns = stats.t.rvs(
+    df=nu, loc=t_loc, scale=t_scale,
+    size=(mc_days, N_SIMS),
+    random_state=42,
+)
 price_paths = current_price * np.cumprod(1 + rand_returns, axis=0)
 portfolio_paths = shares * price_paths  # shape: (mc_days, N_SIMS)
 
@@ -278,18 +312,16 @@ p10 = np.percentile(portfolio_paths, 10, axis=1)
 p50 = np.percentile(portfolio_paths, 50, axis=1)
 p90 = np.percentile(portfolio_paths, 90, axis=1)
 
-final_p10 = portfolio_paths[-1].min() if False else float(p10[-1])
+final_p10 = float(p10[-1])
 final_p50 = float(p50[-1])
 final_p90 = float(p90[-1])
 
 fig_mc, ax_mc = plt.subplots(figsize=(12, 5))
-
 ax_mc.plot(portfolio_paths, color="gray", alpha=0.04, linewidth=0.5)
 ax_mc.plot(p10, color="#e74c3c", linewidth=2, label="10th percentile (worst 10%)")
 ax_mc.plot(p50, color="#2980b9", linewidth=2, label="50th percentile (median)")
 ax_mc.plot(p90, color="#2ecc71", linewidth=2, label="90th percentile (best 10%)")
 ax_mc.axhline(mc_investment, color="black", linewidth=1, linestyle="--", label="Starting value")
-
 ax_mc.set_title(
     f"Monte Carlo Simulation — {mc_ticker} — {N_SIMS:,} paths over {mc_days} trading days",
     fontsize=13, fontweight="bold",
@@ -306,7 +338,13 @@ with st.expander("What does this chart mean?", expanded=True):
     st.info(
         f"""
 **What is Monte Carlo simulation?**
-It runs {N_SIMS:,} hypothetical futures for {TICKERS[mc_ticker]} by randomly sampling daily price moves from its historical return distribution (mean {mu*100:.2f}% / day, volatility {sigma*100:.2f}% / day). Each gray line is one possible outcome — not a prediction, just a range of plausible scenarios.
+It runs {N_SIMS:,} hypothetical futures for {TICKERS[mc_ticker]} by randomly sampling daily price moves from 3 years of historical returns ({n_history} trading days). Each gray line is one possible outcome — not a prediction, just a range of plausible scenarios based on how this ETF has actually behaved.
+
+**Why 3 years of history?**
+Using 3 years instead of 90 days gives a much more reliable picture of the asset's typical behavior across different market conditions — bull runs, corrections, and sideways periods. 90 days might capture only one regime and skew the estimate.
+
+**Why a fat-tailed distribution?**
+Real markets crash and rally more violently than a standard bell curve predicts. This simulation uses a Student's t-distribution (fitted degrees of freedom: {nu:.1f}) which gives more weight to extreme outcomes, so big drawdowns and big gains are modeled more realistically.
 
 **The three highlighted lines**
 - 🟢 **Green (90th percentile):** Only 10% of simulated outcomes end higher than this — a strong bull run.
@@ -321,6 +359,6 @@ It runs {N_SIMS:,} hypothetical futures for {TICKERS[mc_ticker]} by randomly sam
 | Worst 10% | **${final_p10:,.0f}** | {(final_p10/mc_investment - 1)*100:+.1f}% |
 | Best 10% | **${final_p90:,.0f}** | {(final_p90/mc_investment - 1)*100:+.1f}% |
 
-⚠️ **Disclaimer:** These projections are based solely on {TICKERS[mc_ticker]}'s historical volatility over the last 90 days and assume returns are normally distributed. Past volatility does not guarantee future results. This is not financial advice.
+⚠️ **Disclaimer:** These projections are based on {TICKERS[mc_ticker]}'s historical return distribution and are not a guarantee of future results. Past volatility does not predict future performance. This is not financial advice.
         """
     )
