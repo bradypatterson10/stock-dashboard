@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import requests
 from datetime import datetime, timedelta
 
 st.set_page_config(
@@ -24,25 +25,47 @@ RSI_PERIOD = 14
 ZSCORE_WINDOW = 20
 
 
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    return session
+
+
 @st.cache_data(ttl=3600)
 def fetch_data(as_of: str) -> pd.DataFrame:
-    """Download 90 days of closing prices. `as_of` busts cache when user clicks Refresh.
-    Retries with end pushed 2 days forward to handle weekend/holiday boundaries."""
+    """Fetch 90 days of closing prices via Ticker.history() loop.
+    More reliable than bulk yf.download() on cloud servers."""
+    # Point yfinance cache at a writable tmp dir to avoid silent cache failures
+    yf.set_tz_cache_location("/tmp/yfinance_tz")
+
     end = datetime.today()
-    start = end - timedelta(days=LOOKBACK_DAYS + 10)  # small buffer for weekends
+    start = end - timedelta(days=LOOKBACK_DAYS + 10)
 
-    prices = yf.download(list(TICKERS.keys()), start=start, end=end, progress=False)["Close"]
-    prices = prices.dropna(how="all")
+    session = _make_session()
+    frames = {}
+    for ticker in TICKERS:
+        try:
+            hist = yf.Ticker(ticker, session=session).history(
+                start=start.strftime("%Y-%m-%d"),
+                end=(end + timedelta(days=2)).strftime("%Y-%m-%d"),  # +2 covers weekends
+                auto_adjust=True,
+            )
+            if not hist.empty:
+                frames[ticker] = hist["Close"]
+        except Exception as exc:
+            print(f"[fetch_data] {ticker} failed: {exc}")
 
-    if prices.empty:
-        # Weekend/holiday: yfinance sometimes needs end pushed past today to return data
-        end_extended = end + timedelta(days=2)
-        prices = yf.download(
-            list(TICKERS.keys()), start=start, end=end_extended, progress=False
-        )["Close"]
-        prices = prices.dropna(how="all")
+    if not frames:
+        print("[fetch_data] ERROR: all tickers returned empty — possible rate limit")
+        return pd.DataFrame()
 
-    return prices.tail(LOOKBACK_DAYS)
+    prices = pd.DataFrame(frames).dropna(how="all").tail(LOOKBACK_DAYS)
+    print(f"[fetch_data] shape={prices.shape}  last_date={prices.index[-1].date() if not prices.empty else 'N/A'}")
+    return prices
 
 
 def compute_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
