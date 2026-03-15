@@ -1,5 +1,6 @@
+import os
+import time
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -25,45 +26,69 @@ RSI_PERIOD = 14
 ZSCORE_WINDOW = 20
 
 
-def _make_session() -> requests.Session:
-    session = requests.Session()
-    session.headers["User-Agent"] = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    return session
+AV_BASE = "https://www.alphavantage.co/query"
+# Free tier: 25 requests/day, 5 requests/minute.
+# 11 tickers = 11 requests per full fetch. Stay under 5/min with a small delay.
+AV_REQUEST_DELAY = 13  # seconds between ticker calls (safe under 5/min limit)
+
+
+def _fetch_ticker_av(ticker: str, api_key: str, session: requests.Session) -> pd.Series:
+    """Fetch daily closing prices for one ticker from Alpha Vantage."""
+    resp = session.get(AV_BASE, params={
+        "function": "TIME_SERIES_DAILY",
+        "symbol": ticker,
+        "outputsize": "compact",   # last ~100 trading days — enough for 90-day lookback
+        "datatype": "json",
+        "apikey": api_key,
+    }, timeout=15)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    if "Time Series (Daily)" not in payload:
+        # Surface rate-limit / bad key messages from AV
+        note = payload.get("Note") or payload.get("Information") or payload
+        print(f"[fetch_data] {ticker} — unexpected response: {note}")
+        return pd.Series(dtype=float)
+
+    series = pd.Series({
+        pd.Timestamp(date): float(vals["4. close"])
+        for date, vals in payload["Time Series (Daily)"].items()
+    }).sort_index()
+    return series
 
 
 @st.cache_data(ttl=3600)
 def fetch_data(as_of: str) -> pd.DataFrame:
-    """Fetch 90 days of closing prices via Ticker.history() loop.
-    More reliable than bulk yf.download() on cloud servers."""
-    # Point yfinance cache at a writable tmp dir to avoid silent cache failures
-    yf.set_tz_cache_location("/tmp/yfinance_tz")
+    """Fetch 90 days of closing prices from Alpha Vantage TIME_SERIES_DAILY.
+    `as_of` is a cache-bust key; the real data is always fresh on a cache miss."""
+    api_key = os.environ.get("ALPHA_VANTAGE_KEY", "")
+    if not api_key:
+        return pd.DataFrame()   # caller checks and shows st.error()
 
-    end = datetime.today()
-    start = end - timedelta(days=LOOKBACK_DAYS + 10)
+    session = requests.Session()
+    session.headers["User-Agent"] = "sector-dashboard/1.0"
 
-    session = _make_session()
     frames = {}
-    for ticker in TICKERS:
+    tickers = list(TICKERS.keys())
+    for i, ticker in enumerate(tickers):
         try:
-            hist = yf.Ticker(ticker, session=session).history(
-                start=start.strftime("%Y-%m-%d"),
-                end=(end + timedelta(days=2)).strftime("%Y-%m-%d"),  # +2 covers weekends
-                auto_adjust=True,
-            )
-            if not hist.empty:
-                frames[ticker] = hist["Close"]
+            s = _fetch_ticker_av(ticker, api_key, session)
+            if not s.empty:
+                frames[ticker] = s
         except Exception as exc:
             print(f"[fetch_data] {ticker} failed: {exc}")
 
+        # Rate-limit delay between calls (skip after last ticker)
+        if i < len(tickers) - 1:
+            time.sleep(AV_REQUEST_DELAY)
+
     if not frames:
-        print("[fetch_data] ERROR: all tickers returned empty — possible rate limit")
+        print("[fetch_data] ERROR: all tickers returned empty")
         return pd.DataFrame()
 
-    prices = pd.DataFrame(frames).dropna(how="all").tail(LOOKBACK_DAYS)
+    cutoff = datetime.today() - timedelta(days=LOOKBACK_DAYS + 10)
+    prices = pd.DataFrame(frames)
+    prices = prices[prices.index >= pd.Timestamp(cutoff)].dropna(how="all").tail(LOOKBACK_DAYS)
     print(f"[fetch_data] shape={prices.shape}  last_date={prices.index[-1].date() if not prices.empty else 'N/A'}")
     return prices
 
@@ -128,7 +153,16 @@ def make_bar_chart(rs_df: pd.DataFrame, end_date: datetime) -> plt.Figure:
 # ─── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("📈 Sector Relative Strength Dashboard")
-st.caption("Data via Yahoo Finance · Cache refreshes every hour · Prices 15-min delayed")
+st.caption("Data via Alpha Vantage · Cache refreshes every hour · End-of-day prices")
+
+if not os.environ.get("ALPHA_VANTAGE_KEY"):
+    st.error(
+        "**ALPHA_VANTAGE_KEY environment variable is not set.**\n\n"
+        "1. Get a free key at https://www.alphavantage.co/support/#api-key\n"
+        "2. Run: `railway variables set ALPHA_VANTAGE_KEY=<your_key>`\n"
+        "3. Redeploy or wait for Railway to restart the service."
+    )
+    st.stop()
 
 # Cache key: reset when the user clicks the button, otherwise stay on the hour.
 if "cache_key" not in st.session_state:
@@ -145,9 +179,10 @@ with st.spinner("Fetching market data…"):
 
 if prices.empty:
     st.error(
-        "Could not fetch market data from Yahoo Finance. "
-        "This can happen during extended outages or if the ticker list changed. "
-        "Try clicking **Refresh Data** in a few minutes."
+        "Could not fetch market data from Alpha Vantage. "
+        "This usually means the daily request quota (25/day) has been reached, "
+        "or the API key is invalid. Check Railway logs for details. "
+        "Data will be available again tomorrow, or upgrade to a paid AV plan."
     )
     st.stop()
 
